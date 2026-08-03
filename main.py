@@ -42,7 +42,7 @@ MASTER_LEGAL_INSTRUCTION = """คุณคือ "ระบบปฏิบัต
 
 def call_master_legal_gemini(case_fact):
     model = genai.GenerativeModel(
-        model_name='gemini-2.0-flash',
+        model_name='gemini-2.5-flash',
         system_instruction=MASTER_LEGAL_INSTRUCTION
     )
     prompt = f"ข้อเท็จจริงของคดี: {case_fact}\n\nจงวิเคราะห์คดีนี้ตามลำดับทั้ง ๔ ส่วนอย่างละเอียด"
