@@ -1,4 +1,4 @@
+google-genai
 streamlit
-google-generativeai
 python-dotenv
 line-bot-sdk
