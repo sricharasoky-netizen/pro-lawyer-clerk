@@ -3,27 +3,26 @@ from google import genai
 import streamlit as st
 from dotenv import load_dotenv
 
-# โหลดค่า Environment Variables (รองรับทั้งไฟล์ .env และ Streamlit Secrets)
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or st.secrets.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET") or st.secrets.get("LINE_CHANNEL_SECRET", "")
 
-# ตั้งค่าหน้าเว็บ Streamlit Dashboard
 st.set_page_config(page_title="Pro Lawyer Clerk - Line Bot Status", page_icon="⚖️")
 
 st.title("⚖️ Pro Lawyer Clerk - LINE Bot System")
 st.markdown("ระบบหลังบ้านและสถานะการทำงานของบอทกฎหมายบน Streamlit Cloud")
 
-# ตรวจสอบสถานะการเชื่อมต่อ Secrets
-with col1 := st.container():
+col1 = st.container()
+with col1:
     if GOOGLE_API_KEY and LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET:
         st.success("สถานะระบบ: พร้อมเชื่อมต่อ (Connected)")
     else:
         st.error("สถานะระบบ: ขาดข้อมูล Secrets กรุณาตรวจสอบการตั้งค่า")
 
-with col2 := st.container():
+col2 = st.container()
+with col2:
     st.metric(label="โหมดการทำงาน", value="Dashboard Active")
 
 st.markdown("---")
@@ -33,7 +32,6 @@ st.markdown("""
 2. หากตั้งค่า Secrets บนคลาวด์ครบถ้วน บอทใน LINE จะสามารถรับส่งข้อความและรูปภาพได้ทันที
 """)
 
-# ฟังก์ชันทดสอบการเรียกใช้งาน Gemini AI (อัปเดตใช้ SDK และ Model ล่าสุด)
 def ask_gemini(prompt_text):
     if not GOOGLE_API_KEY:
         return "กรุณาตั้งค่า GOOGLE_API_KEY ก่อนใช้งาน"
