@@ -1,101 +1,101 @@
-# requirements.txt ให้ใช้ตามนี้
-# flask
-# python-dotenv
-# line-bot-sdk
-# google-genai
-# pyngrok
-
-import os, time, threading
+import os
+import threading
 from flask import Flask, request, abort
 from dotenv import load_dotenv
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, TextMessage as V3TextMessage, PushMessageRequest
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
-from google import genai
-from google.genai import types
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import google.generativeai as genai
 
+# --- ตั้งค่าเริ่มต้น ---
 load_dotenv()
 app = Flask(__name__)
+genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
 
-# --- ตั้งค่า ---
-client = genai.Client(api_key=os.getenv('GOOGLE_API_KEY'))
-configuration = Configuration(access_token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
+line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-MASTER_LEGAL_INSTRUCTION = """ใส่ MASTER_LEGAL_INSTRUCTION เดิมของคุณพี่ทั้งหมดตรงนี้เหมือนเดิมได้เลยครับ"""
+# --- MASTER SYSTEM INSTRUCTION ---
+MASTER_LEGAL_INSTRUCTION = """คุณคือ "ระบบปฏิบัติการกฎหมายอัจฉริยะขั้นสูง (Legal Lifecycle OS)" ที่รวมจิตวิญญาณและความเชี่ยวชาญของ ๔ ยอดนักกฎหมายไว้ในหนึ่งเดียว 
 
-FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash-8b-latest"]
+เมื่อคุณได้รับข้อเท็จจริงของคดี (Case Fact) หรือรหัสคำสั่ง "พลังสื่อ" ให้คุณสวมบทบาทประมวลผลและแสดงผลลัพธ์แยกออกเป็น ๔ ส่วนตามลำดับ (Step-by-step) อย่างเคร่งครัด ดังนี้:
+
+[ส่วนที่ ๑: ตรวจสำนวนและพิทักษ์สิทธิ]
+- สแกนหาช่องโหว่ ความไม่ชอบมาพากล และการละเมิดสิทธิในสำนวนคดี (เน้นคดีอาญา/แพ่งที่เข้าข่ายฟ้องกลั่นแกล้ง SLAPP)
+- ทำ Gap Analysis ตรวจสอบความสอดคล้องของพยานหลักฐานและชี้จุดที่ข้อมูลขาดหาย
+- ตัดเนื้อความน้ำท่วมทุ่งออก เน้น Fact-Based สกัดใจความสำคัญเป็นหัวข้อสั้นกระชับ
+
+[ส่วนที่ ๒: ที่ปรึกษากฎหมายเชิงยุทธศาสตร์]
+- ให้เปลี่ยนโหมดมาแทนตนเองว่า "ผม" หรือ "ดิฉัน" และเรียกผู้ใช้ว่า "ท่าน" เสมอในส่วนนี้
+- วิเคราะห์พยานหลักฐานดิจิทัล (Forensic Evidence) หาจุดย้อนแย้งและช่องว่างของเวลา (Timeline)
+- ทำ Psychological Profiling วิเคราะห์มูลเหตุจูงใจ (Motive) เพื่อวางแผนซักค้าน และใช้ Reverse Logic คิดมุมกลับเพื่อดักทางคู่กรณี
+
+[ส่วนที่ ๓: เสมียนทนายอาวุโส]
+- สรุปแนวคำพิพากษาศาลฎีกาที่เกี่ยวข้องตามหลัก "10-Deka Retrieval Protocol" (เรียงปีล่าสุด พ.ศ. ๒๕๖๙ ถอยหลัง)
+- แยกหัวข้อ "ส่วนสารบัญญัติ" และ "ส่วนวิธีสบัญญัติ" ให้ชัดเจน ระบุแหล่งที่มาและมาตรากฎหมายให้ถูกต้อง ห้ามมโนเลขมาตรา
+
+[ส่วนที่ ๔: การบริหารจัดการคดีและสรุปภาพรวม (Legal Lifecycle OS)]
+- สรุปแนวทางปฏิบัติของคดีตั้งแต่ชั้นเตรียมฟ้องจนถึงบังคับคดี รักษาบริบทข้อเท็จจริงเดิมไว้
+- หากผู้ใช้ระบุรหัสคำสั่งระบบย่อย "พลังสื่อ ๐๑ ถึง พลังสื่อ ๓๗" (เช่น พลังสื่อ ๑๔) ให้ทำหน้าที่ร่างและประมวลผลเอกสารตามหมวดคำสั่งนั้นในส่วนนี้ทันที
+
+⚠️ กฎเหล็กขั้นเด็ดขาด: ต้องใช้ "ตัวเลขไทย" (๑, ๒, ๓, ๔, ๕...) ในการรายงานผล ร่างเอกสาร และการระบุมาตรา/ปี พ.ศ. ทั้งหมดในทุกส่วนอย่างเคร่งครัด!"""
 
 def call_master_legal_gemini(case_fact):
+    model = genai.GenerativeModel(
+        model_name='gemini-2.0-flash',
+        system_instruction=MASTER_LEGAL_INSTRUCTION
+    )
     prompt = f"ข้อเท็จจริงของคดี: {case_fact}\n\nจงวิเคราะห์คดีนี้ตามลำดับทั้ง ๔ ส่วนอย่างละเอียด"
-    last_error = ""
-    for model_name in FALLBACK_MODELS:
-        try:
-            print(f"⏳ ลองโมเดล: {model_name}")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=MASTER_LEGAL_INSTRUCTION,
-                    temperature=0.2
-                )
-            )
-            print(f"✅ สำเร็จด้วย: {model_name}")
-            return response.text
-        except Exception as e:
-            last_error = str(e)
-            print(f"❌ {model_name} พัง: {last_error}")
-            if "404" in last_error or "429" in last_error or "quota" in last_error.lower():
-                time.sleep(1)
-                continue
-            break
-    raise Exception(last_error)
+    response = model.generate_content(prompt)
+    return response.text
 
 def send_long_message(user_id, text):
-    max_len = 1800
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        if len(text) <= max_len:
-            line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[V3TextMessage(text=text)]))
-        else:
-            # ตัดส่งเป็นท่อน
-            for i in range(0, len(text), max_len):
-                chunk = text[i:i+max_len]
-                line_bot_api.push_message(PushMessageRequest(to=user_id, messages=[V3TextMessage(text=chunk)]))
-                time.sleep(0.6)
+    max_length = 1900
+    if len(text) <= max_length:
+        line_bot_api.push_message(user_id, TextSendMessage(text=text))
+    else:
+        paragraphs = text.split('\n')
+        current_chunk = ""
+        for paragraph in paragraphs:
+            if len(current_chunk) + len(paragraph) + 1 > max_length:
+                line_bot_api.push_message(user_id, TextSendMessage(text=current_chunk.strip()))
+                current_chunk = paragraph + "\n"
+            else:
+                current_chunk += paragraph + "\n"
+        if current_chunk:
+            line_bot_api.push_message(user_id, TextSendMessage(text=current_chunk.strip()))
 
-def run_pipeline(user_id, case_fact):
+def run_legal_pipeline_optimized(user_id, case_fact):
     try:
         final_report = call_master_legal_gemini(case_fact)
         send_long_message(user_id, final_report)
     except Exception as e:
-        err = str(e)
-        if "429" in err: msg = "⚠️ [429] โควต้าสายฟรีเต็ม กรุณารอ ๑ นาทีแล้วพิมพ์ \"ตรวจคดี\" ใหม่อีกครั้งครับ"
-        else: msg = f"ระบบขัดข้อง: {err[:1000]}"
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[V3TextMessage(text=msg)]))
+        error_msg = str(e)
+        if "429" in error_msg:
+            line_bot_api.push_message(user_id, TextSendMessage(text="⚠️ [Resource Exhausted 429] โควต้าเต็ม กรุณารอ ๑ นาทีแล้วลองใหม่อีกครั้งค่ะ"))
+        else:
+            line_bot_api.push_message(user_id, TextSendMessage(text=f"ระบบพบข้อผิดพลาด: {error_msg}"))
 
 @app.route("/webhook", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    try: handler.handle(body, signature)
-    except InvalidSignatureError: abort(400)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
     return 'OK'
 
-@handler.add(MessageEvent, message=TextMessageContent)
+@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     msg = event.message.text
     if "ตรวจคดี" in msg or "พลังสื่อ" in msg:
-        case_fact = msg.replace("ตรวจคดี","").replace("พลังสื่อ","").strip() or msg
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).reply_message(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="🤖 ได้รับข้อเท็จจริงแล้ว กำลังวิเคราะห์ ๔ ส่วนแบบม้วนเดียวจบ (๕-๗ วินาที)")]
-            )
-        threading.Thread(target=run_pipeline, args=(event.source.user_id, case_fact), daemon=True).start()
+        case_fact = msg.replace("ตรวจคดี", "").replace("พลังสื่อ", "").strip() or msg
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(text="🤖 ระบบได้รับข้อเท็จจริงแล้ว กำลังวิเคราะห์ ๔ ส่วนแบบม้วนเดียวจบ (๕-๗ วินาที)")
+        )
+        threading.Thread(target=run_legal_pipeline_optimized, args=(event.source.user_id, case_fact)).start()
 
 if __name__ == "__main__":
-    # ถ้าจะรัน local ให้ใช้ ngrok ถ้าจะ deploy บน Render ไม่ต้องใช้ส่วนนี้
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
