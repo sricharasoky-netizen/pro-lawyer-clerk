@@ -1,6 +1,5 @@
+google-generativeai
 flask
 python-dotenv
 line-bot-sdk
-google-genai
-pyngrok
 gunicorn
