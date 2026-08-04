@@ -15,7 +15,8 @@ client = genai.Client(api_key=os.getenv('GOOGLE_API_KEY'))
 configuration = Configuration(access_token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-MASTER_LEGAL_INSTRUCTION = """ใส่ MASTER_LEGAL_INSTRUCTION เดิมของคุณพี่ทั้งหมดตรงนี้เหมือนเดิมได้เลยครับ"""
+# ใส่ MASTER_LEGAL_INSTRUCTION เดิมของคุณพี่ตรงนี้
+MASTER_LEGAL_INSTRUCTION = """คุณคือ Pro Lawyer Clerk ผู้เชี่ยวชาญกฎหมายไทย วิเคราะห์คดี 4 ส่วน... ใส่ของเดิมคุณพี่ทั้งหมดตรงนี้"""
 
 FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.0-flash-lite"]
 
@@ -39,7 +40,7 @@ def call_master_legal_gemini(case_fact):
             last_error = str(e)
             print(f"❌ {model_name} พัง: {last_error}")
             if "404" in last_error or "429" in last_error or "quota" in last_error.lower():
-                time.sleep(1)
+                time.sleep(2)
                 continue
             break
     raise Exception(last_error)
@@ -62,8 +63,10 @@ def run_pipeline(user_id, case_fact):
         send_long_message(user_id, final_report)
     except Exception as e:
         err = str(e)
-        if "429" in err: msg = "⚠ [429] โควต้าสายฟรีเต็ม กรุณารอ ๑ นาทีแล้วพิมพ์ \"ตรวจคดี\" ใหม่อีกครั้งครับ"
-        else: msg = f"ระบบขัดข้อง: {err[:1000]}"
+        if "429" in err:
+            msg = "⚠️ [429] โควต้าสายฟรีเต็ม กรุณารอ ๑ นาทีแล้วพิมพ์ \"ตรวจคดี\" ใหม่อีกครั้งครับ"
+        else:
+            msg = f"ระบบขัดข้อง: {err[:1000]}"
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(PushMessageRequest(to=user_id, messages=[V3TextMessage(text=msg)]))
 
@@ -71,16 +74,17 @@ def run_pipeline(user_id, case_fact):
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    try: handler.handle(body, signature)
-    except InvalidSignatureError: abort(400)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     msg = event.message.text
     if "ตรวจคดี" in msg or "พลังสื่อ" in msg:
-        case_fact = msg.replace("ตรวจคดี","").replace("พลังสื่อ","").strip() or msg
-        # --- จุดที่แก้แล้ว ---
+        case_fact = msg.replace("ตรวจคดี", "").replace("พลังสื่อ", "").strip() or msg
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).reply_message(
                 ReplyMessageRequest(
