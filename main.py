@@ -3,7 +3,7 @@ from flask import Flask, request, abort
 from dotenv import load_dotenv
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, TextMessage as V3TextMessage, PushMessageRequest
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, TextMessage as V3TextMessage, PushMessageRequest, ReplyMessageRequest
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
 from google.genai import types
@@ -11,12 +11,11 @@ from google.genai import types
 load_dotenv()
 app = Flask(__name__)
 
-# --- ตั้งค่า ---
 client = genai.Client(api_key=os.getenv('GOOGLE_API_KEY'))
 configuration = Configuration(access_token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-MASTER_LEGAL_INSTRUCTION = """คุณคือ Pro Lawyer Clerk ผู้ช่วยทนายมืออาชีพ วิเคราะห์คดีตามลำดับ 4 ส่วนอย่างละเอียด กระชับ แม่นกฎหมาย"""
+MASTER_LEGAL_INSTRUCTION = """ใส่ MASTER_LEGAL_INSTRUCTION เดิมของคุณพี่ทั้งหมดตรงนี้เหมือนเดิมได้เลยครับ"""
 
 FALLBACK_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash-8b-latest"]
 
@@ -81,10 +80,13 @@ def handle_message(event):
     msg = event.message.text
     if "ตรวจคดี" in msg or "พลังสื่อ" in msg:
         case_fact = msg.replace("ตรวจคดี","").replace("พลังสื่อ","").strip() or msg
+        # --- จุดที่แก้แล้ว ---
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).reply_message(
-                reply_token=event.reply_token,
-                messages=[V3TextMessage(text="🤖 ได้รับข้อเท็จจริงแล้ว กำลังวิเคราะห์ ๔ ส่วนแบบม้วนเดียวจบ (๕-๗ วินาที)")]
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[V3TextMessage(text="🤖 ได้รับข้อเท็จจริงแล้ว กำลังวิเคราะห์ ๔ ส่วนแบบม้วนเดียวจบ (๕-๗ วินาที)")]
+                )
             )
         threading.Thread(target=run_pipeline, args=(event.source.user_id, case_fact), daemon=True).start()
 
