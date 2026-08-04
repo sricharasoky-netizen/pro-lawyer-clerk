@@ -1,4 +1,6 @@
-google-genai
-streamlit
+flask
 python-dotenv
 line-bot-sdk
+google-genai
+pyngrok
+gunicorn
