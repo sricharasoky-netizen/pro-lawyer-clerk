@@ -81,7 +81,7 @@ def async_process_legal_case(target_id, case_fact):
         except Exception as push_err:
             print(f"❌ Cannot push error message: {push_err}")
 
-@app.route("/callback", methods=['POST'])
+@app.route("/webhook", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
