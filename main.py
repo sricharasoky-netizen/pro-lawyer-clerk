@@ -20,7 +20,7 @@ MASTER_LEGAL_INSTRUCTION = """คุณคือ Pro Lawyer Clerk ผู้เ�
 
 FALLBACK_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.5-pro"
+    "gemini-3.1-flash-lite-preview"
     ]
 
 def call_master_legal_gemini(case_fact):
