@@ -18,7 +18,11 @@ handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 # ใส่ MASTER_LEGAL_INSTRUCTION เดิมของคุณพี่ตรงนี้
 MASTER_LEGAL_INSTRUCTION = """คุณคือ Pro Lawyer Clerk ผู้เชี่ยวชาญกฎหมายไทย วิเคราะห์คดี 4 ส่วน... ใส่ของเดิมคุณพี่ทั้งหมดตรงนี้"""
 
-FALLBACK_MODELS = ["gemini-2.0-flash"]
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-1.5-flash"
+    ]
 
 def call_master_legal_gemini(case_fact):
     prompt = f"ข้อเท็จจริงของคดี: {case_fact}\n\nจงวิเคราะห์คดีนี้ตามลำดับทั้ง ๔ ส่วนอย่างละเอียด"
