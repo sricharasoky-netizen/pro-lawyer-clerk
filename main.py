@@ -30,17 +30,18 @@ GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY")
 LINE_CHANNEL_SECRET = get_secret("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = get_secret("LINE_CHANNEL_ACCESS_TOKEN")
 
-# แยกเวลา Timeout เพื่อสกัดอาการค้าง 504 และป้องกัน Gunicorn ตัดไฟที่ 30 วินาที
-ai_client_search = genai.Client(
-    api_key=GOOGLE_API_KEY,
-    http_options=types.HttpOptions(timeout=14000),
-)
-ai_client_fast = genai.Client(
+# ตั้ง Timeout กระชับเพื่อสลับโมเดลสำรองได้ทันภายใน 25 วินาที (ก่อน Gunicorn ตัดที่ 30 วินาที)
+ai_client_primary = genai.Client(
     api_key=GOOGLE_API_KEY,
     http_options=types.HttpOptions(timeout=12000),
 )
+ai_client_backup = genai.Client(
+    api_key=GOOGLE_API_KEY,
+    http_options=types.HttpOptions(timeout=10000),
+)
 
-MODEL_NAME = "gemini-3.8-flash"
+PRIMARY_MODEL = "gemini-3.8-flash"
+BACKUP_MODEL = "gemini-3.8-flash-lite"  # สมองสำรองความเร็วสูง แก้ปัญหา 503 High Demand ช่วงหัวค่ำ
 
 BASE_CONFIG = types.GenerateContentConfig(
     system_instruction=MASTER_LEGAL_INSTRUCTION,
@@ -72,32 +73,32 @@ def get_chat_session_id(event: MessageEvent) -> str:
     return f"user_{getattr(event.source, 'user_id', 'default')}"
 
 
-def generate_fast_reply(session_id: str, user_text: str) -> str:
+def generate_smart_reply(session_id: str, user_text: str, is_group: bool) -> str | None:
     history = user_histories.get(session_id, [])
     contents = history + [types.Content(role="user", parts=[types.Part.from_text(text=user_text)])]
     use_search = any(kw in user_text for kw in SEARCH_KEYWORDS)
+    primary_cfg = SEARCH_CONFIG if use_search else BASE_CONFIG
 
-    # ชั้นที่ 1: หากมีคำสั่งค้นหา ให้ยิงผ่าน Google Search ก่อน (จำกัดเวลา 14 วินาที)
-    if use_search:
-        try:
-            response = ai_client_search.models.generate_content(
-                model=MODEL_NAME,
-                contents=contents,
-                config=SEARCH_CONFIG,
-            )
-            reply = (response.text or "").strip()
-            if reply:
-                user_histories[session_id] = (
-                    contents + [types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
-                )[-8:]
-                return reply
-        except Exception as search_err:
-            print(f"⚠️ Search Fallback Triggered: {search_err}")
-
-    # ชั้นที่ 2: โหมดปกติ หรือสลับมาใช้สมองหลักอัตโนมัติทันทีเมื่อ Google Search ช้าเกินเวลา (กัน 504)
+    # ชั้นที่ 1: ลองสมองหลัก (gemini-3.8-flash)
     try:
-        response = ai_client_fast.models.generate_content(
-            model=MODEL_NAME,
+        response = ai_client_primary.models.generate_content(
+            model=PRIMARY_MODEL,
+            contents=contents,
+            config=primary_cfg,
+        )
+        reply = (response.text or "").strip()
+        if reply:
+            user_histories[session_id] = (
+                contents + [types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
+            )[-8:]
+            return reply
+    except Exception as primary_err:
+        print(f"⚠️ Primary model busy ({primary_err}), switching to backup...")
+
+    # ชั้นที่ 2: สลับสมองสำรองความเร็วสูง (gemini-3.8-flash-lite) ทันทีเมื่อติด 503 / 504 / 429
+    try:
+        response = ai_client_backup.models.generate_content(
+            model=BACKUP_MODEL,
             contents=contents,
             config=BASE_CONFIG,
         )
@@ -107,15 +108,14 @@ def generate_fast_reply(session_id: str, user_text: str) -> str:
                 contents + [types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
             )[-8:]
             return reply
-        return "ไม่พบข้อความตอบกลับจากระบบค่ะคุณครู"
-    except Exception as err:
-        err_str = str(err)
-        print(f"⚠️ Gemini Error: {err_str}")
-        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-            return "⏳ ขณะนี้มีคำสั่งเข้ามาพร้อมกันจำนวนมาก รบกวนรอสัก ๓๐ วินาทีแล้วเรียกน้อนหนูใหม่อีกครั้งนะคะ"
-        if "504" in err_str or "DEADLINE" in err_str or "timeout" in err_str.lower():
-            return "⏳ ระบบต้นทางใช้เวลาค้นหาข้อมูลนานเกินกำหนด รบกวนลองส่งคำสั่งแบบกระชับอีกครั้งนะคะคุณครู"
-        return "ขออภัยค่ะคุณครู ระบบประมวลผลขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งนะคะ"
+    except Exception as backup_err:
+        err_str = str(backup_err)
+        print(f"⚠️ Backup model error: {err_str}")
+        if is_group:
+            return "⏳ ขณะนี้เซิร์ฟเวอร์ AI ต้นทางมีผู้ใช้งานหนาแน่นชั่วคราว รบกวนเรียกน้อนหนูใหม่อีกครั้งในอีกสักครู่นะคะ"
+        return f"⏳ ขณะนี้เซิร์ฟเวอร์ AI ต้นทางคิวแน่นชั่วคราวค่ะคุณครู กรุณาลองใหม่อีกครั้งในอีกสักครู่นะคะ ({err_str[:80]})"
+
+    return None
 
 
 def split_text_for_line(text: str, max_length: int = 4500) -> list[str]:
@@ -137,7 +137,7 @@ def split_text_for_line(text: str, max_length: int = 4500) -> list[str]:
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "model": MODEL_NAME, "mode": "group_wake_word_enabled"})
+    return jsonify({"status": "ok", "primary": PRIMARY_MODEL, "backup": BACKUP_MODEL, "group_shield": True})
 
 
 @app.route("/callback", methods=["POST"])
@@ -155,17 +155,18 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event: MessageEvent):
     source_type = getattr(event.source, "type", "user")
+    is_group = source_type in ("group", "room")
     session_id = get_chat_session_id(event)
     raw_text = event.message.text.strip()
 
-    # ถ้ารับข้อความจากในไลน์กลุ่ม ต้องขึ้นต้นด้วยคำเรียกชื่อเท่านั้นจึงจะทำงาน
-    if source_type in ("group", "room"):
+    # เกราะป้องกันไลน์กลุ่ม: ถ้าไม่ได้ขึ้นต้นด้วยคำว่า "น้อนหนู" หรือ "เสมียน" ให้เงียบสนิททันที 100%
+    if is_group:
         matched_wake = next((w for w in WAKE_WORDS if raw_text.startswith(w)), None)
         if not matched_wake:
             return
         user_text = raw_text[len(matched_wake):].strip(" :,-")
         if not user_text:
-            user_text = "สวัสดีจ้าน้อนหนู รายงานตัวหน่อย"
+            user_text = "สวัสดีจ้าน้อนหนู รายงานตัวสั้นๆ ให้พี่ๆ ทนายความในกลุ่มฟังหน่อย"
     else:
         user_text = raw_text
 
@@ -177,13 +178,12 @@ def handle_text_message(event: MessageEvent):
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[TextMessage(text="🧹 ล้างความจำห้องนี้เรียบร้อยแล้วค่ะคุณครู พร้อมรับคำสั่งใหม่ค่ะ!")],
+                    messages=[TextMessage(text="🧹 ล้างความจำห้องนี้เรียบร้อยแล้วค่ะ พร้อมรับคำสั่งใหม่ค่ะ!")],
                 )
             )
             return
 
-        # แสดงจุดกระพริบเฉพาะแชตส่วนตัว (เพราะ LINE รองรับฟีเจอร์นี้เฉพาะแชต 1 ต่อ 1)
-        if source_type == "user" and getattr(event.source, "user_id", None):
+        if not is_group and getattr(event.source, "user_id", None):
             try:
                 line_bot_api.show_loading_animation(
                     ShowLoadingAnimationRequest(chatId=event.source.user_id, loadingSeconds=25)
@@ -191,9 +191,10 @@ def handle_text_message(event: MessageEvent):
             except Exception:
                 pass
 
-        reply_text = generate_fast_reply(session_id, user_text)
-        messages = [TextMessage(text=c) for c in split_text_for_line(reply_text)]
-        line_bot_api.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=messages))
+        reply_text = generate_smart_reply(session_id, user_text, is_group=is_group)
+        if reply_text:
+            messages = [TextMessage(text=c) for c in split_text_for_line(reply_text)]
+            line_bot_api.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=messages))
 
 
 if __name__ == "__main__":
