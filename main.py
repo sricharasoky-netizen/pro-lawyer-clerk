@@ -89,6 +89,7 @@ def health_check():
 
 
 @app.route("/callback", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
@@ -170,3 +171,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"🚀 เปิดเซิร์ฟเวอร์ Flask เสมียนทนายมือโปร 8-in-1 ที่พอร์ต {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
+
