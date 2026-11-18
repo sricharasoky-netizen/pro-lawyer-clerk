@@ -1,154 +1,172 @@
 import os
-import time
-import threading
-from flask import Flask, request, abort
-from dotenv import load_dotenv
-
+from dotenv import dotenv_values, load_dotenv
+from flask import Flask, abort, jsonify, request
+from google import genai
+from google.genai import types
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, TextMessage, PushMessageRequest
+from linebot.v3.messaging import (
+    ApiClient,
+    Configuration,
+    MessagingApi,
+    ReplyMessageRequest,
+    ShowLoadingAnimationRequest,
+    TextMessage,
+)
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-import google.genai as genai
-from google.genai import types
+from instructions import MASTER_LEGAL_INSTRUCTION
 
-load_dotenv()
+# 1. โหลดกุญแจสำคัญ (รองรับทั้งไฟล์ .env ในเครื่อง และ Environment บน Cloud)
+load_dotenv(override=True)
+env_vars = dotenv_values(".env")
+
+
+def get_secret(key_name: str) -> str:
+    val = env_vars.get(key_name) or os.getenv(key_name) or ""
+    return val.strip().strip('"').strip("'")
+
+
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY")
+LINE_CHANNEL_SECRET = get_secret("LINE_CHANNEL_SECRET")
+LINE_CHANNEL_ACCESS_TOKEN = get_secret("LINE_CHANNEL_ACCESS_TOKEN")
+
+if not GOOGLE_API_KEY:
+    raise RuntimeError("❌ ไม่พบ GOOGLE_API_KEY ในระบบ กรุณาตรวจสอบไฟล์ .env")
+if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
+    raise RuntimeError("❌ ไม่พบค่าเชื่อมต่อ LINE ในไฟล์ .env")
+
+# 2. ตั้งค่าสมอง Gemini 3.8 Flash + Google Search ค้นฎีกาจริง
+ai_client = genai.Client(api_key=GOOGLE_API_KEY)
+MODEL_NAME = "gemini-3.8-flash"
+
+AI_CONFIG = types.GenerateContentConfig(
+    system_instruction=MASTER_LEGAL_INSTRUCTION,
+    temperature=0.2,
+    tools=[types.Tool(google_search=types.GoogleSearch())],
+)
+
+# เก็บความจำแยกตามรายบุคคล เพื่อให้กดสลับโหมด 1-8 และคุยต่อเนื่องได้
+user_chats = {}
+
+# 3. ตั้งค่า Flask App และ LINE Messaging API (SDK v3)
 app = Flask(__name__)
+line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ตั้งค่า Google GenAI Client และ LINE API
-client = genai.Client(api_key=os.getenv('GOOGLE_API_KEY'))
-configuration = Configuration(access_token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
-handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
-# คำสั่ง Master Legal Instruction
-MASTER_LEGAL_INSTRUCTION = """คุณคือ "Pro Lawyer Clerk" ผู้ช่วยวิเคราะห์คดีความด้านกฎหมายไทย
+def split_text_for_line(text: str, max_length: int = 4500) -> list[str]:
+    """หั่นข้อความยาวเกินลิมิต LINE ออกเป็นส่วนๆ อัตโนมัติ (สูงสุด 5 บอลลูน)"""
+    text = text.strip()
+    if not text:
+        return ["ขออภัยค่ะ ระบบไม่สามารถสร้างคำตอบได้ในขณะนี้ กรุณาลองใหม่อีกครั้งนะคะ"]
+    if len(text) <= max_length:
+        return [text]
 
-เมื่อคุณได้รับข้อเท็จจริงของคดี (Case Fact) ให้วิเคราะห์และแสดงผลลัพธ์แยกเป็น 4 ส่วนตามลำดับ (Step-by-step) อย่างเคร่งครัด ดังนี้:
-
-[ส่วนที่ 1: ตรวจสำนวนและพิทักษ์สิทธิ (Fact & Rights Check)]
-- สแกนหาช่องโหว่ ความไม่ชอบมาพากล และความเสี่ยงต่อการถูกละเมิดสิทธิในสำนวนคดี
-- ตรวจสอบความสอดคล้องของพยานหลักฐานและชี้จุดที่ข้อมูลยังขาดหาย
-- สรุปเฉพาะข้อเท็จจริงที่จำเป็น เป็นหัวข้อสั้นกระชับ ไม่พรรณนาเกินความจำเป็น
-
-[ส่วนที่ 2: วิเคราะห์เชิงกลยุทธ์ (Strategic Analysis)]
-- วิเคราะห์พยานหลักฐานและลำดับเหตุการณ์ (Timeline) เพื่อหาจุดที่ต้องตรวจสอบเพิ่มเติม
-- ประเมินแนวทางที่เป็นไปได้สำหรับการเตรียมคดี รวมถึงประเด็นที่ควรระวังจากฝ่ายตรงข้าม
-
-[ส่วนที่ 3: ค้นคว้าแนวคำพิพากษา (Case Law Research)]
-- สรุปแนวคำพิพากษาศาลฎีกาที่เกี่ยวข้อง เรียงจากปีล่าสุดย้อนหลัง
-- แยกหัวข้อ "ส่วนสารบัญญัติ" และ "ส่วนวิธีสบัญญัติ" ให้ชัดเจน ระบุแหล่งที่มาและมาตรากฎหมายให้ถูกต้อง ห้ามระบุเลขมาตราที่ไม่มีแหล่งอ้างอิงจริง
-
-[ส่วนที่ 4: สรุปภาพรวมและแนวทางดำเนินคดี (Case Overview & Roadmap)]
-- สรุปแนวทางปฏิบัติของคดีตั้งแต่ชั้นเตรียมฟ้องจนถึงชั้นบังคับคดี โดยรักษาบริบทข้อเท็จจริงเดิมไว้ตลอด
-- ระบุขั้นตอนถัดไปที่ผู้ใช้ควรดำเนินการ พร้อมข้อควรระวัง
-
-หลักการเขียนผลลัพธ์: ใช้ภาษาที่เป็นทางการ กระชับ ชัดเจน ตรวจสอบย้อนกลับได้ และไม่คาดเดาข้อเท็จจริงที่ไม่ได้รับมา"""
-
-# รุ่นโมเดล Gemini ที่ใช้งานได้จริง
-FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-3.1-flash-lite-preview"
-]
-
-def call_master_legal_gemini(case_fact):
-    prompt = f"ข้อเท็จจริงของคดี: {case_fact}\n\nจงวิเคราะห์คดีนี้ตามลำดับทั้ง 4 ส่วนอย่างละเอียด"
-    last_error = ""
-    for model_name in FALLBACK_MODELS:
-        try:
-            print(f"⏳ ลองโมเดล: {model_name}")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=MASTER_LEGAL_INSTRUCTION,
-                    temperature=0.2
-                )
-            )
-            print(f"✅ สำเร็จด้วย: {model_name}")
-            return response.text
-        except Exception as e:
-            last_error = str(e)
-            print(f"❌ {model_name} พลาด: {last_error}")
-            if "404" in last_error or "429" in last_error or "quota" in last_error.lower():
-                time.sleep(2)
-                continue
+    chunks = []
+    while text and len(chunks) < 5:
+        if len(text) <= max_length:
+            chunks.append(text)
             break
-    raise Exception(last_error)
+        split_pos = text.rfind("\n", 0, max_length)
+        if split_pos == -1 or split_pos < max_length // 2:
+            split_pos = max_length
+        chunks.append(text[:split_pos].strip())
+        text = text[split_pos:].strip()
+    return chunks
 
-def async_process_legal_case(target_id, case_fact):
-    """ฟังก์ชันทำงานเบื้องหลัง วิเคราะห์คดีและส่งข้อความตอบกลับไปยัง ID ปลายทาง"""
-    try:
-        legal_result = call_master_legal_gemini(case_fact)
-        
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.push_message(
-                PushMessageRequest(
-                    to=target_id,
-                    messages=[TextMessage(text=legal_result)]
-                )
-            )
-    except Exception as e:
-        print(f"❌ Async Process Error: {e}")
-        try:
-            with ApiClient(configuration) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.push_message(
-                    PushMessageRequest(
-                        to=target_id,
-                        messages=[TextMessage(text=f"ระบบขัดข้อง: {str(e)}")]
-                    )
-                )
-        except Exception as push_err:
-            print(f"❌ Cannot push error message: {push_err}")
 
-@app.route("/webhook", methods=['POST'])
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify(
+        {
+            "status": "ok",
+            "bot": "Pro Lawyer Clerk 8-in-1 (Flask)",
+            "model": MODEL_NAME,
+            "google_search_grounding": True,
+        }
+    )
+
+
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get('X-Line-Signature', '')
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        abort(400)
+        abort(400, description="Invalid LINE signature")
 
-    return 'OK'
+    return "OK", 200
+
 
 @handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
+def handle_text_message(event: MessageEvent):
+    user_id = event.source.user_id
     user_text = event.message.text.strip()
 
-    if user_text.startswith("ตรวจคดี"):
-        # หา ID ปลายทางเพื่อตอบกลับให้ถูกห้อง (กลุ่ม หรือ แชตส่วนตัว)
-        source_type = event.source.type
-        if source_type == 'group':
-            target_id = event.source.group_id
-        elif source_type == 'room':
-            target_id = event.source.room_id
-        else:
-            target_id = event.source.user_id
+    with ApiClient(line_config) as api_client:
+        line_bot_api = MessagingApi(api_client)
 
-        case_fact = user_text[7:].strip()
-        if not case_fact:
-            case_fact = "ไม่มีการระบุข้อเท็จจริงเพิ่มเติม กรุณาวิเคราะห์ตามข้อความทั่วไป"
-
-        # ส่งข้อความแจ้งเตือนเบื้องต้นก่อน
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.push_message(
-                PushMessageRequest(
-                    to=target_id,
-                    messages=[TextMessage(text="🤖 ได้รับข้อเท็จจริงแล้ว กำลังวิเคราะห์ 4 ส่วนแบบละเอียด (5-10 วินาที)")]
+        # คำสั่งล้างความจำเพื่อเริ่มคดีใหม่
+        if user_text.lower() in {"เริ่มใหม่", "ล้างความจำ", "reset", "clear"}:
+            user_chats.pop(user_id, None)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(
+                            text="🧹 ล้างความจำบทสนทนาเดิมเรียบร้อยแล้วค่ะคุณครู พร้อมรับคำสั่งคดีใหม่หรือกดเลือกโหมด ๑-๘ ได้เลยค่ะ!"
+                        )
+                    ],
                 )
             )
+            return
 
-        # เริ่มทำงานเบื้องหลังส่งไปที่ target_id
-        thread = threading.Thread(
-            target=async_process_legal_case,
-            args=(target_id, case_fact)
+        # แสดงจุดกระพริบกำลังโหลดระหว่างวิ่งค้นฎีกาใน Google
+        if user_id:
+            try:
+                line_bot_api.show_loading_animation(
+                    ShowLoadingAnimationRequest(chatId=user_id, loadingSeconds=40)
+                )
+            except Exception:
+                pass
+
+        if user_id not in user_chats:
+            user_chats[user_id] = ai_client.chats.create(
+                model=MODEL_NAME,
+                config=AI_CONFIG,
+            )
+
+        try:
+            response = user_chats[user_id].send_message(user_text)
+            reply_text = response.text or "ไม่พบข้อมูลตอบกลับจากระบบค่ะ"
+        except Exception:
+            # กรณีเซสชันสะดุด ให้สร้างห้องความจำใหม่แล้วยิงซ้ำอัตโนมัติ 1 ครั้ง
+            try:
+                user_chats[user_id] = ai_client.chats.create(
+                    model=MODEL_NAME,
+                    config=AI_CONFIG,
+                )
+                response = user_chats[user_id].send_message(user_text)
+                reply_text = response.text or "ไม่พบข้อมูลตอบกลับจากระบบค่ะ"
+            except Exception as retry_err:
+                print(f"⚠️ Gemini Error: {retry_err}")
+                reply_text = "ขออภัยค่ะคุณครู ระบบประมวลผลขัดข้องชั่วคราว กรุณาส่งคำสั่งใหม่อีกครั้งนะคะ"
+
+        chunks = split_text_for_line(reply_text)
+        messages = [TextMessage(text=chunk) for chunk in chunks]
+
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=messages,
+            )
         )
-        thread.start()
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 เปิดเซิร์ฟเวอร์ Flask เสมียนทนายมือโปร 8-in-1 ที่พอร์ต {port}...")
+    app.run(host="0.0.0.0", port=port, debug=False)
