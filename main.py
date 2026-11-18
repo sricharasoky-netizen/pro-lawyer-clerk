@@ -30,10 +30,16 @@ GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY")
 LINE_CHANNEL_SECRET = get_secret("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = get_secret("LINE_CHANNEL_ACCESS_TOKEN")
 
-ai_client = genai.Client(
+# แยกเวลา Timeout เพื่อสกัดอาการค้าง 504 และป้องกัน Gunicorn ตัดไฟที่ 30 วินาที
+ai_client_search = genai.Client(
     api_key=GOOGLE_API_KEY,
-    http_options=types.HttpOptions(timeout=22000),  # ล็อกเวลาไม่เกิน 22 วินาที กัน Gunicorn ตัดไฟ!
+    http_options=types.HttpOptions(timeout=14000),
 )
+ai_client_fast = genai.Client(
+    api_key=GOOGLE_API_KEY,
+    http_options=types.HttpOptions(timeout=12000),
+)
+
 MODEL_NAME = "gemini-3.8-flash"
 
 BASE_CONFIG = types.GenerateContentConfig(
@@ -48,6 +54,8 @@ SEARCH_CONFIG = types.GenerateContentConfig(
 )
 
 SEARCH_KEYWORDS = ("ฎีกา", "ค้น", "สืบค้น", "หาข้อมูล", "ล่าสุด", "เว็บ", "อ้างอิง", "พ.ร.บ.", "พระราชบัญญัติ")
+WAKE_WORDS = ("น้อนหนู", "@น้อนหนู", "เสมียน", "@เสมียน")
+
 user_histories: dict[str, list[types.Content]] = {}
 
 app = Flask(__name__)
@@ -55,21 +63,47 @@ line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 
-def generate_fast_reply(user_id: str, user_text: str) -> str:
-    history = user_histories.get(user_id, [])
+def get_chat_session_id(event: MessageEvent) -> str:
+    source_type = getattr(event.source, "type", "user")
+    if source_type == "group":
+        return f"group_{getattr(event.source, 'group_id', 'default')}"
+    if source_type == "room":
+        return f"room_{getattr(event.source, 'room_id', 'default')}"
+    return f"user_{getattr(event.source, 'user_id', 'default')}"
+
+
+def generate_fast_reply(session_id: str, user_text: str) -> str:
+    history = user_histories.get(session_id, [])
     contents = history + [types.Content(role="user", parts=[types.Part.from_text(text=user_text)])]
     use_search = any(kw in user_text for kw in SEARCH_KEYWORDS)
-    cfg = SEARCH_CONFIG if use_search else BASE_CONFIG
 
+    # ชั้นที่ 1: หากมีคำสั่งค้นหา ให้ยิงผ่าน Google Search ก่อน (จำกัดเวลา 14 วินาที)
+    if use_search:
+        try:
+            response = ai_client_search.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=SEARCH_CONFIG,
+            )
+            reply = (response.text or "").strip()
+            if reply:
+                user_histories[session_id] = (
+                    contents + [types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
+                )[-8:]
+                return reply
+        except Exception as search_err:
+            print(f"⚠️ Search Fallback Triggered: {search_err}")
+
+    # ชั้นที่ 2: โหมดปกติ หรือสลับมาใช้สมองหลักอัตโนมัติทันทีเมื่อ Google Search ช้าเกินเวลา (กัน 504)
     try:
-        response = ai_client.models.generate_content(
+        response = ai_client_fast.models.generate_content(
             model=MODEL_NAME,
             contents=contents,
-            config=cfg,
+            config=BASE_CONFIG,
         )
         reply = (response.text or "").strip()
         if reply:
-            user_histories[user_id] = (
+            user_histories[session_id] = (
                 contents + [types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
             )[-8:]
             return reply
@@ -78,8 +112,10 @@ def generate_fast_reply(user_id: str, user_text: str) -> str:
         err_str = str(err)
         print(f"⚠️ Gemini Error: {err_str}")
         if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-            return "⏳ โควตาของ API Key ปัจจุบันเต็ม (429) ค่ะคุณครู แนะนำให้สร้าง API Key ใหม่แบบ 'Create API key in new project' ใน Google AI Studio (จะได้รหัสขึ้นต้นด้วย AIzaSy...) แล้วนำมาใส่ใน Render Environment นะคะ"
-        return f"⚠️ ระบบแจ้งเตือนขัดข้องชั่วคราวค่ะคุณครู ({err_str[:120]})"
+            return "⏳ ขณะนี้มีคำสั่งเข้ามาพร้อมกันจำนวนมาก รบกวนรอสัก ๓๐ วินาทีแล้วเรียกน้อนหนูใหม่อีกครั้งนะคะ"
+        if "504" in err_str or "DEADLINE" in err_str or "timeout" in err_str.lower():
+            return "⏳ ระบบต้นทางใช้เวลาค้นหาข้อมูลนานเกินกำหนด รบกวนลองส่งคำสั่งแบบกระชับอีกครั้งนะคะคุณครู"
+        return "ขออภัยค่ะคุณครู ระบบประมวลผลขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งนะคะ"
 
 
 def split_text_for_line(text: str, max_length: int = 4500) -> list[str]:
@@ -101,7 +137,7 @@ def split_text_for_line(text: str, max_length: int = 4500) -> list[str]:
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "model": MODEL_NAME})
+    return jsonify({"status": "ok", "model": MODEL_NAME, "mode": "group_wake_word_enabled"})
 
 
 @app.route("/callback", methods=["POST"])
@@ -118,23 +154,36 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event: MessageEvent):
-    user_id = event.source.user_id or "default_user"
-    user_text = event.message.text.strip()
+    source_type = getattr(event.source, "type", "user")
+    session_id = get_chat_session_id(event)
+    raw_text = event.message.text.strip()
+
+    # ถ้ารับข้อความจากในไลน์กลุ่ม ต้องขึ้นต้นด้วยคำเรียกชื่อเท่านั้นจึงจะทำงาน
+    if source_type in ("group", "room"):
+        matched_wake = next((w for w in WAKE_WORDS if raw_text.startswith(w)), None)
+        if not matched_wake:
+            return
+        user_text = raw_text[len(matched_wake):].strip(" :,-")
+        if not user_text:
+            user_text = "สวัสดีจ้าน้อนหนู รายงานตัวหน่อย"
+    else:
+        user_text = raw_text
 
     with ApiClient(line_config) as api_client:
         line_bot_api = MessagingApi(api_client)
 
         if user_text.lower() in {"เริ่มใหม่", "ล้างความจำ", "reset", "clear"}:
-            user_histories.pop(user_id, None)
+            user_histories.pop(session_id, None)
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[TextMessage(text="🧹 ล้างความจำเรียบร้อยแล้วค่ะคุณครู พร้อมรับคำสั่งใหม่ค่ะ!")],
+                    messages=[TextMessage(text="🧹 ล้างความจำห้องนี้เรียบร้อยแล้วค่ะคุณครู พร้อมรับคำสั่งใหม่ค่ะ!")],
                 )
             )
             return
 
-        if event.source.user_id:
+        # แสดงจุดกระพริบเฉพาะแชตส่วนตัว (เพราะ LINE รองรับฟีเจอร์นี้เฉพาะแชต 1 ต่อ 1)
+        if source_type == "user" and getattr(event.source, "user_id", None):
             try:
                 line_bot_api.show_loading_animation(
                     ShowLoadingAnimationRequest(chatId=event.source.user_id, loadingSeconds=25)
@@ -142,7 +191,7 @@ def handle_text_message(event: MessageEvent):
             except Exception:
                 pass
 
-        reply_text = generate_fast_reply(user_id, user_text)
+        reply_text = generate_fast_reply(session_id, user_text)
         messages = [TextMessage(text=c) for c in split_text_for_line(reply_text)]
         line_bot_api.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=messages))
 
