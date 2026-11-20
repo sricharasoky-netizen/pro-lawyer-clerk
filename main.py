@@ -40,8 +40,8 @@ ai_client_backup = genai.Client(
     http_options=types.HttpOptions(timeout=10000),
 )
 
-PRIMARY_MODEL = "gemini-3.8-flash"
-BACKUP_MODEL = "gemini-3.8-flash-lite"  # สมองสำรองความเร็วสูง แก้ปัญหา 503 High Demand ช่วงหัวค่ำ
+PRIMARY_MODEL = "gemini-2.5-flash"
+BACKUP_MODEL = "gemini-2.5-flash-lite"  # สมองสำรองความเร็วสูง แก้ปัญหา 503 High Demand ช่วงหัวค่ำ
 
 BASE_CONFIG = types.GenerateContentConfig(
     system_instruction=MASTER_LEGAL_INSTRUCTION,
