@@ -130,4 +130,95 @@ def generate_smart_reply(session_id: str, user_text: str, is_group: bool) -> str
                         config=BASE_CONFIG,
                     )
                     reply = (response.text or "").strip()
-                    i
+                    if reply:
+                        user_histories[session_id] = (
+                            contents + [types.Content(role="model", parts=[types.Part.from_text(text=reply)])]
+                        )[-8:]
+                        return reply
+                except Exception as retry_err:
+                    last_error = str(retry_err)
+
+    return f"⏳ ขณะนี้เซิร์ฟเวอร์ AI ต้นทางคิวแน่นชั่วคราว รบกวนเรียกน้อนหนูใหม่อีกครั้งนะคะ ({last_error[:100]})"
+
+
+def split_text_for_line(text: str, max_length: int = 4500) -> list[str]:
+    text = text.strip() or "ขออภัยค่ะ ระบบไม่สามารถสร้างคำตอบได้ในขณะนี้ค่ะ"
+    if len(text) <= max_length:
+        return [text]
+    chunks = []
+    while text and len(chunks) < 5:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+        split_pos = text.rfind("\n", 0, max_length)
+        if split_pos == -1 or split_pos < max_length // 2:
+            split_pos = max_length
+        chunks.append(text[:split_pos].strip())
+        text = text[split_pos:].strip()
+    return chunks
+
+
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok", "models": get_candidate_models(), "group_shield": True})
+
+
+@app.route("/callback", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400, description="Invalid LINE signature")
+    return "OK", 200
+
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_text_message(event: MessageEvent):
+    source_type = getattr(event.source, "type", "user")
+    is_group = source_type in ("group", "room")
+    session_id = get_chat_session_id(event)
+    raw_text = event.message.text.strip()
+
+    if is_group:
+        matched_wake = next((w for w in WAKE_WORDS if raw_text.startswith(w)), None)
+        if not matched_wake:
+            return
+        user_text = raw_text[len(matched_wake):].strip(" :,-")
+        if not user_text:
+            user_text = "สวัสดีจ้าน้อนหนู รายงานตัวสั้นๆ ให้พี่ๆ ทนายความในกลุ่มฟังหน่อย"
+    else:
+        user_text = raw_text
+
+    with ApiClient(line_config) as api_client:
+        line_bot_api = MessagingApi(api_client)
+
+        if user_text.lower() in {"เริ่มใหม่", "ล้างความจำ", "reset", "clear"}:
+            user_histories.pop(session_id, None)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="🧹 ล้างความจำห้องนี้เรียบร้อยแล้วค่ะ พร้อมรับคำสั่งใหม่ค่ะ!")],
+                )
+            )
+            return
+
+        if not is_group and getattr(event.source, "user_id", None):
+            try:
+                line_bot_api.show_loading_animation(
+                    ShowLoadingAnimationRequest(chatId=event.source.user_id, loadingSeconds=25)
+                )
+            except Exception:
+                pass
+
+        reply_text = generate_smart_reply(session_id, user_text, is_group=is_group)
+        if reply_text:
+            messages = [TextMessage(text=c) for c in split_text_for_line(reply_text)]
+            line_bot_api.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=messages))
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=False)
