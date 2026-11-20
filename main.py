@@ -1,4 +1,8 @@
+import io
 import os
+import re
+import xml.etree.ElementTree as ET
+import zipfile
 from dotenv import dotenv_values, load_dotenv
 from flask import Flask, abort, jsonify, request
 from google import genai
@@ -55,7 +59,8 @@ SEARCH_CONFIG = types.GenerateContentConfig(
 
 SEARCH_KEYWORDS = ("ฎีกา", "ค้น", "สืบค้น", "หาข้อมูล", "ล่าสุด", "เว็บ", "อ้างอิง", "พ.ร.บ.", "พระราชบัญญัติ")
 WAKE_WORDS = ("น้อนหนู", "@น้อนหนู", "เสมียน", "@เสมียน")
-MAX_FILE_BYTES = 10 * 1024 * 1024  # จำกัดขนาดไฟล์ใน LINE ไม่เกิน 10 MB เพื่อให้ตอบทันใน 25 วินาที
+SUPPORTED_EXTENSIONS = (".pdf", ".doc", ".docx", ".txt")
+MAX_FILE_BYTES = 10 * 1024 * 1024
 
 user_histories: dict[str, list[types.Content]] = {}
 pending_media: dict[str, dict] = {}
@@ -64,6 +69,58 @@ cached_models: list[str] = []
 app = Flask(__name__)
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+
+def extract_text_from_word_or_txt(data: bytes, filename: str) -> str:
+    """แกะข้อความจากไฟล์ .docx, .doc และ .txt โดยไม่ต้องพึ่งไลบรารีภายนอก"""
+    name_low = filename.lower()
+
+    if name_low.endswith(".txt"):
+        for enc in ("utf-8", "cp874", "tis-620", "utf-16"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("utf-8", errors="ignore")
+
+    # กรณีที่ 1: ไฟล์ .docx (หรือ .doc ที่โครงสร้างภายในเป็น ZIP XML)
+    if data[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                if "word/document.xml" in z.namelist():
+                    xml_content = z.read("word/document.xml")
+                    tree = ET.fromstring(xml_content)
+                    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+                    paragraphs = []
+                    for p in tree.iter(f"{ns}p"):
+                        texts = [t.text for t in p.iter(f"{ns}t") if t.text]
+                        if texts:
+                            paragraphs.append("".join(texts))
+                    extracted = "\n".join(paragraphs).strip()
+                    if extracted:
+                        return extracted
+        except Exception as e:
+            print(f"⚠️ DOCX parse warning: {e}")
+
+    # กรณีที่ 2: ไฟล์ Word รุ่นเก่า (.doc Binary OLE2) ดึงข้อความภาษาไทยจาก UTF-16LE และ CP874
+    chunks = []
+    try:
+        text_u16 = data.decode("utf-16le", errors="ignore")
+        found_u16 = re.findall(r"[\u0e00-\u0e7fA-Za-z0-9\s\.,\-\(\)/:;'\"฿%\r\n]{6,}", text_u16)
+        chunks.extend(c.strip() for c in found_u16 if re.search(r"[\u0e01-\u0e4f]{2,}", c))
+    except Exception:
+        pass
+
+    if not chunks:
+        try:
+            text_cp874 = data.decode("cp874", errors="ignore")
+            found_cp874 = re.findall(r"[\u0e00-\u0e7fA-Za-z0-9\s\.,\-\(\)/:;'\"฿%\r\n]{8,}", text_cp874)
+            chunks.extend(c.strip() for c in found_cp874 if re.search(r"[\u0e01-\u0e4f]{3,}", c))
+        except Exception:
+            pass
+
+    cleaned = "\n".join(chunks).strip()
+    return cleaned[:35000]
 
 
 def get_candidate_models() -> list[str]:
@@ -107,13 +164,24 @@ def generate_smart_reply(
     user_text: str,
     media_bytes: bytes | None = None,
     mime_type: str | None = None,
+    extracted_doc_text: str | None = None,
+    doc_filename: str | None = None,
 ) -> str | None:
     history = user_histories.get(session_id, [])
 
     user_parts = []
     if media_bytes and mime_type:
         user_parts.append(types.Part.from_bytes(data=media_bytes, mime_type=mime_type))
-    user_parts.append(types.Part.from_text(text=user_text))
+
+    full_prompt = user_text
+    if extracted_doc_text:
+        full_prompt = (
+            f"📄 [เนื้อหาจากไฟล์เอกสาร '{doc_filename or 'เอกสาร Word'}']:\n"
+            f"{extracted_doc_text}\n\n"
+            f"📌 [คำสั่งของคุณครู]: {user_text}"
+        )
+
+    user_parts.append(types.Part.from_text(text=full_prompt))
 
     contents = history + [types.Content(role="user", parts=user_parts)]
     use_search = any(kw in user_text for kw in SEARCH_KEYWORDS) and not media_bytes
@@ -130,8 +198,7 @@ def generate_smart_reply(
             )
             reply = (response.text or "").strip()
             if reply:
-                # เก็บประวัติเฉพาะข้อความเพื่อไม่ให้หน่วยความจำเต็มจากไฟล์ภาพขนาดใหญ่
-                text_only_turn = types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
+                text_only_turn = types.Content(role="user", parts=[types.Part.from_text(text=full_prompt[:4000])])
                 model_turn = types.Content(role="model", parts=[types.Part.from_text(text=reply)])
                 user_histories[session_id] = (history + [text_only_turn, model_turn])[-8:]
                 return reply
@@ -147,7 +214,7 @@ def generate_smart_reply(
                     )
                     reply = (response.text or "").strip()
                     if reply:
-                        text_only_turn = types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
+                        text_only_turn = types.Content(role="user", parts=[types.Part.from_text(text=full_prompt[:4000])])
                         model_turn = types.Content(role="model", parts=[types.Part.from_text(text=reply)])
                         user_histories[session_id] = (history + [text_only_turn, model_turn])[-8:]
                         return reply
@@ -181,7 +248,7 @@ def health_check():
             "status": "ok",
             "models": get_candidate_models(),
             "group_shield": True,
-            "vision_pdf_enabled": True,
+            "supported_files": SUPPORTED_EXTENSIONS,
         }
     )
 
@@ -240,16 +307,19 @@ def handle_text_message(event: MessageEvent):
             except Exception:
                 pass
 
-        # ดึงรูปหรือไฟล์ PDF ล่าสุดที่ส่งค้างไว้ในห้อง (ถ้ามี) มาวิเคราะห์ร่วมกับคำสั่งทันที
         media_item = pending_media.pop(session_id, None)
-        media_bytes = media_item["bytes"] if media_item else None
-        mime_type = media_item["mime_type"] if media_item else None
+        media_bytes = media_item.get("bytes") if media_item else None
+        mime_type = media_item.get("mime_type") if media_item else None
+        extracted_doc_text = media_item.get("text") if media_item else None
+        doc_filename = media_item.get("filename") if media_item else None
 
         reply_text = generate_smart_reply(
             session_id,
             user_text,
             media_bytes=media_bytes,
             mime_type=mime_type,
+            extracted_doc_text=extracted_doc_text,
+            doc_filename=doc_filename,
         )
         if reply_text:
             messages = [TextMessage(text=c) for c in split_text_for_line(reply_text)]
@@ -260,112 +330,5 @@ def handle_text_message(event: MessageEvent):
 def handle_image_message(event: MessageEvent):
     source_type = getattr(event.source, "type", "user")
     is_group = source_type in ("group", "room")
-    session_id = get_chat_session_id(event)
-
-    with ApiClient(line_config) as api_client:
-        blob_api = MessagingApiBlob(api_client)
-        line_bot_api = MessagingApi(api_client)
-
-        try:
-            img_bytes = bytes(blob_api.get_message_content(event.message.id))
-        except Exception as e:
-            print(f"⚠️ Failed to download image: {e}")
-            return
-
-        if len(img_bytes) > MAX_FILE_BYTES:
-            if not is_group:
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="⚠️ รูปภาพมีขนาดใหญ่เกิน ๑๐ MB รบกวนส่งผ่านน้อนหนูบนเว็บ AiPASS แทนนะคะ")],
-                    )
-                )
-            return
-
-        # ในไลน์กลุ่ม: เก็บรูปไว้ในความจำเงียบๆ รอให้ทนายพิมพ์ "น้อนหนู..." สั่งงาน
-        if is_group:
-            pending_media[session_id] = {"bytes": img_bytes, "mime_type": "image/jpeg"}
-            return
-
-        # ในแชทส่วนตัว: อ่านและวิเคราะห์รูปให้ทันที
-        if getattr(event.source, "user_id", None):
-            try:
-                line_bot_api.show_loading_animation(
-                    ShowLoadingAnimationRequest(chatId=event.source.user_id, loadingSeconds=25)
-                )
-            except Exception:
-                pass
-
-        prompt = "ช่วยอ่านข้อความในภาพนี้ทั้งหมดอย่างละเอียด สรุปข้อเท็จจริง วันเวลา จำนวนเงิน คู่กรณี และจุดสังเกตทางกฎหมายให้ครบถ้วนค่ะ"
-        reply_text = generate_smart_reply(session_id, prompt, media_bytes=img_bytes, mime_type="image/jpeg")
-        if reply_text:
-            messages = [TextMessage(text=c) for c in split_text_for_line(reply_text)]
-            line_bot_api.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=messages))
-
-
-@handler.add(MessageEvent, message=FileMessageContent)
-def handle_file_message(event: MessageEvent):
-    source_type = getattr(event.source, "type", "user")
-    is_group = source_type in ("group", "room")
-    session_id = get_chat_session_id(event)
-    file_name = getattr(event.message, "file_name", "document.pdf") or "document.pdf"
-
-    if not file_name.lower().endswith(".pdf"):
-        if not is_group:
-            with ApiClient(line_config) as api_client:
-                MessagingApi(api_client).reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="📄 ขณะนี้น้อนหนูใน LINE รองรับเฉพาะไฟล์นามสกุล .pdf และรูปภาพนะคะ")],
-                    )
-                )
-        return
-
-    with ApiClient(line_config) as api_client:
-        blob_api = MessagingApiBlob(api_client)
-        line_bot_api = MessagingApi(api_client)
-
-        try:
-            pdf_bytes = bytes(blob_api.get_message_content(event.message.id))
-        except Exception as e:
-            print(f"⚠️ Failed to download PDF: {e}")
-            return
-
-        if len(pdf_bytes) > MAX_FILE_BYTES:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text=f"📄 ไฟล์ {file_name} มีขนาดใหญ่เกิน ๑๐ MB แนะนำให้อัปโหลดให้น้อนหนูบนเว็บ AiPASS เพื่อวิเคราะห์สำนวนขนาดใหญ่ได้ครบทุกหน้าค่ะ"
-                        )
-                    ],
-                )
-            )
-            return
-
-        # ในไลน์กลุ่ม: เก็บไฟล์ PDF ไว้รอคำสั่ง "น้อนหนู..."
-        if is_group:
-            pending_media[session_id] = {"bytes": pdf_bytes, "mime_type": "application/pdf"}
-            return
-
-        # ในแชทส่วนตัว: อ่านและสรุปไฟล์ PDF ทันที
-        if getattr(event.source, "user_id", None):
-            try:
-                line_bot_api.show_loading_animation(
-                    ShowLoadingAnimationRequest(chatId=event.source.user_id, loadingSeconds=25)
-                )
-            except Exception:
-                pass
-
-        prompt = f"ช่วยอ่านไฟล์เอกสาร PDF ชื่อ '{file_name}' นี้และสรุปข้อเท็จจริง ประเด็นข้อกฎหมาย และจุดสำคัญให้ครบถ้วนค่ะ"
-        reply_text = generate_smart_reply(session_id, prompt, media_bytes=pdf_bytes, mime_type="application/pdf")
-        if reply_text:
-            messages = [TextMessage(text=c) for c in split_text_for_line(reply_text)]
-            line_bot_api.reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=messages))
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    session_id = get_ch
 
